@@ -1,0 +1,8 @@
+*.pyproj
+*.sln
+.vs/*
+idaapi.py
+.env
+.vscode
+*.pyc
+.DS_Store
