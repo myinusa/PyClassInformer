@@ -1,16 +1,11 @@
-import struct
-
 import idc
 import idautils
 import ida_bytes
 import ida_search
 import ida_idaapi
 import ida_segment
-import ida_xref
 import ida_typeinf
 import ida_nalt
-import ida_offset
-import ida_name
 import ida_ida
 
 try:
@@ -23,12 +18,12 @@ try:
     import ida_struct
     from ida_struct import get_member_by_name
 except ModuleNotFoundError:
-    # for IDA 9.0
     ida_9_or_later = True
+
     def get_member_by_name(tif, name):
         if not tif.is_struct():
             return None
-    
+
         udm = ida_typeinf.udm_t()
         udm.name = name
         idx = tif.find_udm(udm, ida_typeinf.STRMEM_NAME)
@@ -38,33 +33,34 @@ except ModuleNotFoundError:
 
 
 class utils(object):
-    text = 0
-    data = 0
-    rdata = 0
-    valid_ranges = []
-    within = lambda self, x, rl: any([True for r in rl if r[0]<=x<=r[1]])
-
-    REF_OFF = 0
-    x64 = 0
-    PTR_TYPE = 0
-    PTR_SIZE = 0
+    DATA_SEGMENT_CLASSES = {"DATA", "CONST", "BSS", "STRLIT", "INIT", "XTRN"}
 
     def __init__(self):
-        self.text = ida_segment.get_segm_by_name(".text")
-        self.data = ida_segment.get_segm_by_name(".data")
-        self.rdata = ida_segment.get_segm_by_name(".rdata")
-        # try to use rdata if there actually is an rdata segment, otherwise just use data
-        if self.rdata is not None and self.data is not None:
-            self.valid_ranges = [(self.rdata.start_ea, self.rdata.end_ea), (self.data.start_ea, self.data.end_ea)]
-        # fail safe for renaming segment names
-        else:
-            self.valid_ranges = []
-            for n in range(ida_segment.get_segm_qty()):
-                seg = ida_segment.getnseg(n)
-                if seg and ida_segment.get_segm_class(seg) == "DATA" and seg and not seg.is_header_segm():
-                    self.valid_ranges.append((seg.start_ea, seg.end_ea))
+        self.text = None
+        self.data = None
+        self.rdata = None
+        self.code_segments = []
+        self.data_segments = []
+        self.valid_ranges = []
+        self.refresh_segments()
 
-        self.x64 = (ida_segment.getnseg(0).bitness == 2)
+        self.x64 = False
+        try:
+            self.x64 = bool(ida_ida.inf_is_64bit())
+        except AttributeError:
+            inf = None
+            get_inf = getattr(ida_idaapi, "get_inf_structure", None)
+            if callable(get_inf):
+                inf = get_inf()
+            if inf and hasattr(inf, "is_64bit"):
+                self.x64 = bool(inf.is_64bit())
+            else:
+                try:
+                    self.x64 = bool(ida_idaapi.cvar.inf.is_64bit())
+                except AttributeError:
+                    lflags = getattr(ida_idaapi.cvar.inf, "lflags", 0)
+                    self.x64 = bool(lflags & getattr(ida_ida, "LFLG_64BIT", 0))
+
         if self.x64:
             self.PTR_TYPE = ida_bytes.FF_QWORD
             self.REF_OFF = ida_nalt.REF_OFF64
@@ -75,45 +71,114 @@ class utils(object):
             self.REF_OFF = ida_nalt.REF_OFF32
             self.PTR_SIZE = 4
             self.get_ptr = ida_bytes.get_32bit
-            
-    @staticmethod
-    def get_data_segments():
-        for n in range(ida_segment.get_segm_qty()):
-            seg = ida_segment.getnseg(n)
-            if seg and ida_segment.get_segm_class(seg) == "DATA" and seg and not seg.is_header_segm():
-                yield seg
-            
+
+    def refresh_segments(self):
+        self.code_segments = []
+        self.data_segments = []
+
+        preferred_text = ida_segment.get_segm_by_name(".text")
+        preferred_data = ida_segment.get_segm_by_name(".data")
+        preferred_rdata = ida_segment.get_segm_by_name(".rdata")
+
+        self.text = preferred_text
+        self.data = preferred_data
+        self.rdata = preferred_rdata
+
+        seg_qty = ida_segment.get_segm_qty()
+        for idx in range(seg_qty):
+            seg = ida_segment.getnseg(idx)
+            if not seg or seg.is_header_segm():
+                continue
+
+            seg_name = ida_segment.get_segm_name(seg) or ""
+            lname = seg_name.lower()
+            seg_class = ida_segment.get_segm_class(seg)
+            perms = getattr(seg, "perm", -1)
+            if perms == -1:
+                perms = ida_segment.get_segm_attr(seg.start_ea, ida_segment.SEGATTR_PERM)
+            if perms == -1:
+                perms = 0
+
+            is_exec = bool(perms & ida_segment.SEGPERM_EXEC)
+            is_read = bool(perms & ida_segment.SEGPERM_READ)
+
+            if seg_class == "CODE" or is_exec:
+                self.code_segments.append(seg)
+                if self.text is None and (lname.startswith(".text") or is_exec):
+                    self.text = seg
+                continue
+
+            is_data_like = seg_class in self.DATA_SEGMENT_CLASSES or (is_read and not is_exec)
+            if not is_data_like:
+                continue
+
+            self.data_segments.append(seg)
+            if self.data is None and lname.startswith(".data"):
+                self.data = seg
+            if self.rdata is None and lname.startswith(".rdata"):
+                self.rdata = seg
+
+        if self.text is None and self.code_segments:
+            self.text = self.code_segments[0]
+        self.valid_ranges = [(seg.start_ea, seg.end_ea) for seg in self.data_segments]
+
+    def get_data_segments(self):
+        if not self.data_segments:
+            self.refresh_segments()
+        return list(self.data_segments)
+
     def update_valid_ranges(self):
-        self.valid_ranges = []
-        for seg in utils.get_data_segments():
-            self.valid_ranges.append((seg.start_ea, seg.end_ea))
+        self.refresh_segments()
+
+    def get_candidate_data_segments(self):
+        segments = []
+        seen = set()
+
+        def add_segment(seg):
+            if seg is None:
+                return
+            key = (seg.start_ea, seg.end_ea)
+            if key in seen:
+                return
+            segments.append(seg)
+            seen.add(key)
+
+        add_segment(self.rdata)
+        add_segment(self.data)
+        for seg in self.get_data_segments():
+            add_segment(seg)
+        return segments
 
     # for 32-bit binaries, the RTTI structs contain absolute addresses, but for
     # 64-bit binaries, they're offsets from the image base.
     def x64_imagebase(self):
         if self.x64:
             return ida_nalt.get_imagebase()
-        else:
-            return 0
-        
+        return 0
+
     def get_strlen(self, addr, max_len=500):
-        # 50 is sometimes too short. I increased a number here.
         strlen = 0
-        #while get_byte(addr+strlen) != 0x0 and strlen < 50:
         while ida_bytes.get_byte(addr+strlen) != 0x0 and strlen < max_len:
-            strlen+=1
-        #assume no names will ever be longer than 50 bytes
-        #if strlen == 50:
+            strlen += 1
         if strlen == max_len:
             return None
         return strlen
 
     def is_vtable(self, addr):
         function = self.get_ptr(addr)
-        # Check if vtable has ref and its first pointer lies within code segment
-        if ida_bytes.has_xref(ida_bytes.get_full_flags(addr)) and function >= self.text.start_ea and function <= self.text.end_ea:
+        if not ida_bytes.has_xref(ida_bytes.get_full_flags(addr)):
+            return False
+        if function == ida_idaapi.BADADDR:
+            return False
+        for seg in self.code_segments:
+            if seg.start_ea <= function <= seg.end_ea:
+                return True
+        return ida_bytes.is_code(ida_bytes.get_full_flags(function))
+
+    def within(self, value, ranges):
+        if not ranges:
             return True
-        return False
+        return any(start <= value <= end for start, end in ranges)
 
     @staticmethod
     def to_signed32(n):
@@ -133,8 +198,6 @@ class utils(object):
                 yield xref
                 
     def add_ptr_or_rva_member(self, sid, mname, mtype_name, array=False, idx=-1):
-        sname = idc.get_struc_name(sid)
-        
         # if idx is not specified, insert the member at the end of the structure
         if idx < 0:
             idx = idc.get_member_qty(sid)
@@ -398,7 +461,6 @@ def get_offset_fptr(v, force_bitness=False):
 
 
 def get_vtbl_methods(target_ea):
-    orig_target_ea = target_ea
     prev_target_ea = target_ea
     item_diff = 8
     seg = ida_segment.getseg(target_ea)
