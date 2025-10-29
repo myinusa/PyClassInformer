@@ -1,15 +1,13 @@
 import idc
 import ida_idaapi
 import ida_typeinf
-import ida_offset
 import ida_bytes
 import ida_nalt
-import ida_xref
-import ida_kernwin
 import ida_auto
 import ida_name
 import ida_ida
 import ida_idp
+import pyclassinformer
 
 try:
     ModuleNotFoundError
@@ -605,15 +603,12 @@ class rtti_parser(object):
             return result
         
         # find vftables with relevant structures
-        if u.rdata and not alldata:
-            result = rtti_parser.parse(u.rdata.start_ea, u.rdata.end_ea)
-        # if .rdata was not found, try multiple data segments
-        else:
-            # expand ranges to check to all data
-            u.update_valid_ranges()
-            
-            # get all data segments' results
-            for seg in u.get_data_segments():
-                result.update(rtti_parser.parse(seg.start_ea, seg.end_ea))
+        u.update_valid_ranges()
+        for seg in u.get_candidate_data_segments():
+            if not seg:
+                continue
+            result.update(rtti_parser.parse(seg.start_ea, seg.end_ea))
+            if result and not alldata:
+                break
         return result
     
